@@ -1,0 +1,106 @@
+let TimeRange = 120d;        
+let TimeWindow = 60s;      
+let MinDownloads = 1;     
+let MaxTimeWindow = 10m;   
+// Suspicious Sign-ins
+let SuspiciousSignIns = SigninLogs
+    | where TimeGenerated >= ago(TimeRange)
+    | where ResultType == "0"   // successful sign-ins
+    | where isnotempty(UserPrincipalName) and isnotempty(IPAddress)
+    | where isempty(DeviceDetail.displayName)
+    | project 
+        SignInTime = TimeGenerated,
+        UserPrincipalName,
+        UserId = UserPrincipalName,
+        IPAddress,
+        RiskLevel = RiskLevelDuringSignIn,
+        Location,
+        AutonomousSystemNumber;
+let SuspiciousFileDownloads = OfficeActivity
+    | where TimeGenerated >= ago(TimeRange)
+    | where Operation in (
+        "FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial",
+        "MessageDownloaded", "AttachmentDownloaded", "FileUploaded"
+        )
+    //| where OfficeWorkload in ("SharePoint", "OneDrive", "MicrosoftTeams", "Exchange")
+    | where isnotempty(UserId) and isnotempty(SourceFileName)
+    | where not(SourceFileName matches regex @"(?i)\.(tmp|temp|cache|log|~)$")
+    | where not(SourceFileName startswith "~")
+    // Focus on meaningful file types
+    | where SourceFileName matches regex @"(?i)\.(doc|docx|pdf|xls|xlsx|ppt|pptx|zip|rar|7z|csv|txt|json|xml|bak|pst|msg)$"
+    | extend 
+        FileName = tostring(SourceFileName),
+        DownloadTime = TimeGenerated,
+        IPAddress1 = tostring(ClientIP),
+        UserAgent = tostring(UserAgent),
+        OfficeWorkload,
+        Operation
+    | project DownloadTime, UserId, FileName, IPAddress1, UserAgent, OfficeWorkload, Operation;
+let CorrelatedEvents = SuspiciousSignIns
+    | join kind=inner (
+        SuspiciousFileDownloads
+        | where isnotempty(UserId)
+        )
+        on UserId
+    | where DownloadTime between (SignInTime .. (SignInTime + TimeWindow))
+    | where IPAddress == IPAddress1
+    | project 
+        SignInTime, 
+        UserPrincipalName, 
+        IPAddress, 
+        RiskLevel, 
+        Location, 
+        DownloadTime, 
+        FileName, 
+        OfficeWorkload, 
+        Operation, 
+        UserAgent,
+        AutonomousSystemNumber;
+let BulkDownloads = CorrelatedEvents
+    | summarize 
+        FirstDownload = min(DownloadTime),
+        LastDownload = max(DownloadTime),
+        DownloadCount = count(),
+        UniqueFiles = dcount(FileName),
+        FileNames = make_list(FileName, 20),
+        Workloads = make_set(OfficeWorkload),
+        Operations = make_set(Operation),
+        UserAgents = make_set(UserAgent)
+        by
+        SignInTime,
+        UserPrincipalName,
+        IPAddress,
+        AutonomousSystemNumber,
+        RiskLevel,
+        tostring(Location)
+    | extend DownloadDuration = LastDownload - FirstDownload
+    | where (DownloadCount >= MinDownloads and DownloadDuration <= MaxTimeWindow and UniqueFiles >= 2)
+        or (DownloadCount >= 5 or (DownloadCount >= 3 and DownloadDuration <= 1m));
+BulkDownloads
+| join kind=leftouter (
+    IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | project AccountUPN, Country = tostring(Country)
+    )
+    on $left.UserPrincipalName == $right.AccountUPN
+| join kind=leftouter (
+    _GetWatchlist('Alpha2')
+    | project Land = ["Land"], Alpha2 = ["Alpha2"]
+    )
+    on $left.Country == $right.Land
+| extend loc = iff(Country == Land, Alpha2, "")
+| project 
+    SignInTime,
+    UserPrincipalName,
+    Home = Country,
+    IP_ASN = strcat(IPAddress, " - ", "AS", AutonomousSystemNumber),
+    UserLoc_IPLoc = strcat(iff(isempty(loc), "N/A", loc), " -> ", Location),
+    DownloadCount,
+    UniqueFiles,
+    DownloadDuration,
+    Workloads,
+    Operations,
+    SampleFiles = strcat_array(array_slice(FileNames, 0, 5), "; "),
+    UserAgents,
+    RiskLevel
+| order by DownloadCount desc, SignInTime desc
