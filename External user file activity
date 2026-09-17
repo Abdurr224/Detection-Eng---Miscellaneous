@@ -1,0 +1,24 @@
+let Alert = SecurityAlert 
+| where AlertName contains "External user file activity"
+| where Status != "Resolved"
+| extend parse_json(tostring(Entities))
+| project Entities[0].Upn;
+OfficeActivity
+| where UserId  in (Alert)
+| extend 
+     PersonalDrive = extract(@"/personal/([^/]+)/Documents/", 1, tostring(OfficeObjectId)),
+     DocumentAccessed = extract(@"(?:/([^/]+))/([^/]+)$", 0, tostring(OfficeObjectId)),
+     object = replace(@"\.", "[.]", replace(@"http", "hxxp", tostring(OfficeObjectId)))
+| where isnotempty(object) and isnotempty(PersonalDrive) and isnotempty(DocumentAccessed)
+| where DocumentAccessed matches regex @"\.[a-zA-Z0-9]{2,5}$"
+| summarize 
+Object = make_set(object), 
+Accesseduser = make_set(PersonalDrive), 
+File = make_set(DocumentAccessed) 
+by UserId
+| extend pluraluser = iff(array_length( Accesseduser) >= 2, "users ","user "),
+         pluralfile = iff(array_length( Object) >= 2, "files: ","file: "),
+         personalobject = iff(Object contains "personal", " personal drive"," drive")
+| extend ClosureComment = strcat( "The user ","",UserId," accessed ",pluralfile , File, " in ", pluraluser, Accesseduser,"'s", personalobject)
+| extend Comment = replace(@"[""\[\]\\]", "", tostring(ClosureComment))
+| project UserId, Object, Accesseduser, File, Comment
