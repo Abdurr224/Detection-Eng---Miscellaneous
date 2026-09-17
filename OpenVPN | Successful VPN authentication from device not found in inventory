@@ -1,0 +1,31 @@
+let lookback = 1h;
+let excludedDomains = dynamic([
+    "rayacx.com", "niocomm.com", "indigotg.com", "4spfn.com",
+    "cyient.com", "ccncommunications.co.uk", "kkcutilities.com",
+    "circet.co.uk", "ge-servicesltd.com", "kngroup.com",
+    "btconnect.com", "sccialphatrack.co.uk",
+    "ingrammicroukcsp.onmicrosoft.com", "d-c.co.uk",
+    "nortonrosefulbright.com", "1minus1.com", "netadminsystems.com",
+    "toob.co.uk", "eplus", "adtran.com"
+]);
+OpenVPNLogs_CL
+| where TimeGenerated > ago(lookback)
+| extend LogMsg = extract(@"OUT: '.*?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (.*)'", 1, RawData)
+| where LogMsg contains "peer connection" and LogMsg contains "@toob.co.uk"
+| extend IP = extract(@"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+", 1, LogMsg)
+| extend User = extract(@"\[([^\]]+@[^\]]+)\]", 1, LogMsg)
+| join kind=leftanti (
+    DeviceInfo
+    | where TimeGenerated > ago(30d)
+    | summarize by PublicIP
+    | project JoinKey = PublicIP
+) on $left.IP == $right.JoinKey
+| join (
+    IdentityInfo
+    | where TimeGenerated > ago(30d)
+    | extend Domain = tolower(tostring(split(MailAddress, "@")[-1]))
+    | where not(Domain has_any (excludedDomains))
+    | extend JoinKey = tolower(AccountUPN)
+    | distinct JoinKey, JobTitle, Department, MailAddress
+) on $left.User == $right.JoinKey
+| project TimeGenerated, User, IP, MailAddress, JobTitle, Department, LogMsg
