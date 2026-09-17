@@ -1,0 +1,81 @@
+let shannon_entropy = (T:(*), column: string) {
+    T
+    | mv-apply i=extract_all('(.)', column_ifexists(column, "")) to typeof(string) on (
+        summarize count() by i
+        | summarize occurrences=make_list(count_)
+    )
+    | mv-apply i=occurrences to typeof(real) on (
+        extend entropy=-log2(i/strlen(column_ifexists(column, "")))*(i/strlen(column_ifexists(column, "")))
+        | summarize ShannonEntropy=sum(entropy)
+    )
+    | project-away occurrences
+};
+let exclusions = dynamic(["news@focusgroup.co.uk","codonnell-easyvista.com@shared1.ccsend.com","confluence@gaicrm.atlassian.net","donotreply@match.indeed.com"]);
+let HDKeywords = dynamic(["IT Support", "Helpdesk", "Service Desk",
+"IT Admin", "Tech Support", "Microsoft Support", "IT Department"]);
+let Base =
+    EmailEvents
+    | where TimeGenerated >= ago(30d)
+    | where Subject has_any (HDKeywords)
+    | where SenderFromAddress !in (exclusions)
+    | join kind=leftouter EmailUrlInfo on NetworkMessageId
+    | join kind=leftouter EmailAttachmentInfo on NetworkMessageId
+    | where EmailDirection != "Intra-org";
+let DomainScores =
+    Base
+    //url strip and labelling
+    | where isnotempty(UrlDomain)
+    | where Url !endswith "png"
+    | distinct UrlDomain
+    | extend host = tolower(tostring(UrlDomain))               
+    | extend parts = split(host, ".")
+    | extend nparts = array_length(parts)
+    | extend sld = tostring(parts[nparts-2]), tld = tostring(parts[nparts-1])
+    | extend suffixLen = iff(strlen(tld) == 2 and sld in ("co","com","org","net","ac","gov","edu","me","ltd","plc"), 2, 1)
+    | extend candidates = array_slice(parts, 0, nparts - suffixLen - 1)  
+    | mv-expand label = candidates to typeof(string)
+    | extend label = tostring(label)
+    | where isnotempty(label) and label != "www"            
+    | extend llen = strlen(label)
+    | extend digit_ratio = toreal(array_length(extract_all(@"([0-9])", label))) / llen      
+    | extend vowel_ratio = toreal(array_length(extract_all(@"([aeiou])", label))) / llen     
+    | extend has_internal_digit = array_length(extract_all(@"([0-9][a-z])", label)) > 0      
+    | invoke shannon_entropy("label")                            
+    | extend LabelEntropy = ShannonEntropy
+    //conditionals based on length and ratios
+    | extend SuspiciousLabel = iff(
+           (llen >= 7  and has_internal_digit)                   // digit/letter mix
+        or (llen >= 6  and vowel_ratio <= 0.10)                  // no vowels
+        or (llen >= 10 and digit_ratio >= 0.15)                  // long + digit-heavy
+        or (llen >= 12 and LabelEntropy >= 3.6)                  // long + high-entropy
+        , 1, 0)
+    | summarize
+        UrlDomainEntropy = round(max(LabelEntropy), 3),
+        MaxDigitRatio    = round(max(digit_ratio), 3),
+        MinVowelRatio    = round(min(vowel_ratio), 3),
+        SuspiciousDomain = max(SuspiciousLabel)
+      by UrlDomain;
+Base
+| lookup kind=leftouter DomainScores on UrlDomain
+| where DeliveryLocation in ("Inbox/folder")
+| where SuspiciousDomain == 1                             
+| summarize
+    NetworkMessageId = make_set(NetworkMessageId),
+    Subject = make_set(Subject),
+    SenderFromAddress = make_set(SenderFromAddress),
+    SenderDisplayName = make_set(SenderDisplayName),
+    RecipientEmailAddress = make_set(RecipientEmailAddress),
+    ForwardingInformation = make_set(ForwardingInformation),
+    UrlCount = make_set(UrlCount),
+    Url = make_set(Url),
+    UrlDomain = make_set(UrlDomain),
+    UrlDomainEntropy = make_set(UrlDomainEntropy),
+    MaxDigitRatio = make_set(MaxDigitRatio),                    
+    MinVowelRatio = make_set(MinVowelRatio),                     
+    UrlLocation = make_set(UrlLocation),
+    FileName = make_set(FileName),
+    FileExtension = make_set(FileExtension),
+    DeliveryLocation = make_set(DeliveryLocation),
+    DeliveryAction = make_set(DeliveryAction),
+    make_set(SuspiciousDomain)
+    by TimeGenerated
