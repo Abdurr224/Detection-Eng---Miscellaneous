@@ -1,0 +1,81 @@
+let UserNames =
+    union isfuzzy=true
+        (SigninLogs
+        | project TimeGenerated, UserId, UserPrincipalName),
+        (AADNonInteractiveUserSignInLogs
+        | project TimeGenerated, UserId, UserPrincipalName)
+    | where TimeGenerated > ago(1d)
+    | where isnotempty(UserId) and isnotempty(UserPrincipalName)
+    | summarize arg_max(TimeGenerated, UserPrincipalName) by UserId
+    | project UserId, UserPrincipalName;
+let SpNames =
+    AADServicePrincipalSignInLogs
+    | where TimeGenerated > ago(1d)
+    | where isnotempty(ServicePrincipalId)
+    | summarize arg_max(TimeGenerated, ServicePrincipalName) by ServicePrincipalId
+    | project ServicePrincipalId, ServicePrincipalName;
+let BenignChatter = dynamic([
+    "/beta/me/settings/regionalandlanguagesettings",   // OWA/Outlook background sync
+    "/v1.0/organization/{id}/serviceprovisioninginfo"  // Office client polling
+    ]);
+// Triaged actors only, each with a ticket ref. Never AppIds.
+let KnownBenignActors = dynamic([""]);
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(1h)
+| where ResponseStatusCode in (401, 403)
+| extend Path = tolower(extract(@"https?:\/\/[^\/]+([^?]*)", 1, RequestUri))
+// Normalise volatile segments so dcount = endpoint diversity, not resource diversity
+| extend NormPath = replace_regex(Path, @"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "{id}")
+| extend NormPath = replace_regex(NormPath, @"\/shares\/u![a-z0-9!_%\.\-]+", "/shares/{token}")
+| extend NormPath = replace_regex(NormPath, @"19:[a-z0-9_]+@thread\.v2", "{thread}")
+| extend NormPath = replace_regex(NormPath, @"\/drives\/b![a-z0-9\-_]+", "/drives/{drive}")
+| extend NormPath = replace_regex(NormPath, @"\/items\/[a-z0-9!]{10,}", "/items/{item}")
+// Suppressions: path patterns only, validated against baseline
+| where NormPath !in (BenignChatter)
+| where NormPath !startswith "/v1.0/shares/{token}"
+| where NormPath !has "/thumbnails/"
+| extend ActorId = coalesce(ServicePrincipalId, UserId, AppId)
+| where isnotempty(ActorId)
+| where ActorId !in (KnownBenignActors)
+| extend ActorType = iff(isnotempty(ServicePrincipalId), "ServicePrincipal", "User")
+| extend IsSensitive = NormPath matches regex
+    @"(rolemanagement|directoryroles|serviceprincipals|applications|oauth2permissiongrants|policies|devicemanagement|identity|riskyusers|riskdetections|auditlogs|privilegedaccess|conditionalaccess|domains|onpremisessynchronization)"
+| lookup  kind=leftouter  (union SigninLogs, AADNonInteractiveUserSignInLogs) on SessionId, AppId
+| summarize
+    Failures            = count(),
+    Auth401             = countif(ResponseStatusCode == 401),
+    DistinctDeniedPaths = dcount(NormPath),
+    SensitiveDenied     = dcountif(NormPath, IsSensitive),
+    SamplePaths         = make_set(NormPath, 8),
+    SourceIps           = make_set(IPAddress, 5),
+    LastSeen            = max(TimeGenerated),
+    app = make_set(AppDisplayName,5),
+    auth = any(AuthenticationDetails)
+    by ActorId, ActorType, SessionId
+| where DistinctDeniedPaths >= 6 or SensitiveDenied >= 3
+| lookup kind=leftouter UserNames on $left.ActorId == $right.UserId
+| lookup kind=leftouter SpNames on $left.ActorId == $right.ServicePrincipalId
+| extend ActorName = coalesce(UserPrincipalName, ServicePrincipalName, strcat("unresolved:", ActorId))
+| extend Severity = case(
+                        SensitiveDenied >= 10 and Auth401 == 0,
+                        "High",   
+                        SensitiveDenied >= 5,
+                        "Medium",
+                        "Low"
+                    )
+| project
+    ActorName,
+    ActorType,
+    Severity,
+    SensitiveDenied,
+    DistinctDeniedPaths,
+    Failures,
+    Auth401,
+    SamplePaths,
+    SourceIps,
+    LastSeen,
+    ActorId,SessionId, app, auth
+| extend PrimaryIp = tostring(SourceIps[0])
+| extend IPLoc= geo_info_from_ip_address(PrimaryIp)
+| extend summary = strcat("The ", ActorType, " ",ActorName, " had ", Failures, " failures from app(s) ", tostring(app),".","Attempts are from this sessionID ",SessionId ," where the authentication is: ",tostring(parse_json(auth)[0].authenticationStepResultDetail),". The IP used (",PrimaryIp,") is based in ", IPLoc.state)
+| order by SensitiveDenied desc, DistinctDeniedPaths desc
