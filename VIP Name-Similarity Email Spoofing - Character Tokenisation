@@ -1,0 +1,60 @@
+let KnownLegitDomains = toscalar(
+    _GetWatchlist('KnownVIPDomains')
+    | extend Domain = tolower(tostring(Domain))
+    | summarize make_set(Domain)
+);
+let VipWatchlistData = _GetWatchlist('VipWatchlist')
+    | where tobool(Enabled) == true
+    | extend VipUPN       = tolower(tostring(VipUpn))
+    | extend VipName      = tolower(tostring(VipName))
+    | extend VipFirstName = tostring(split(VipName, " ")[0])
+    | project VipUPN, VipName, VipFirstName;
+let VipUPNs = toscalar(VipWatchlistData
+    | summarize make_list(VipUPN));
+let VipFirstNames = toscalar(VipWatchlistData
+    | summarize make_list(VipFirstName));
+let VipPersonalEmails = toscalar(
+    _GetWatchlist('PersonalVIPEmails')
+    | extend PersonalEmail = tolower(tostring(PersonalEmail))
+    | summarize make_set(PersonalEmail)
+);
+EmailEvents
+| where TimeGenerated > ago(30m)
+| where SenderFromDomain !in (KnownLegitDomains)
+| where SenderFromAddress !in (VipUPNs)
+| where SenderFromAddress !in (VipPersonalEmails)
+| where DeliveryAction == "Delivered"
+| where IsFirstContact == true
+| where isnotempty(SenderDisplayName)
+| extend FakeSender          = tolower(SenderDisplayName)
+| extend FakeSenderFirstName = tostring(split(FakeSender, " ")[0])
+| where FakeSenderFirstName in (VipFirstNames)
+| join hint.strategy=shuffle kind=inner (
+    VipWatchlistData
+) on $left.FakeSenderFirstName == $right.VipFirstName
+| where tolower(RecipientEmailAddress) != VipUPN
+| project-away VipFirstName, FakeSenderFirstName
+| mv-apply
+    c = extract_all("(.)", strcat(VipName, FakeSender)) to typeof(string),
+    s = array_concat(repeat("1", strlen(VipName)), repeat("2", strlen(FakeSender))) to typeof(string)
+    on (
+        summarize hint.shufflekey=c count_diff_abs = abs(countif(s == "2") - countif(s == "1")) by c
+    )
+| extend len1 = strlen(VipName), len2 = strlen(FakeSender)
+| summarize hint.shufflekey=NetworkMessageId
+    diff_absolute = sum(count_diff_abs)
+    by
+    VipName,
+    VipUPN,
+    FakeSender,
+    len1,
+    len2,
+    NetworkMessageId,
+    TimeGenerated,
+    SenderFromAddress,
+    RecipientEmailAddress,
+    Subject
+| extend diff_absolute2 = iff(diff_absolute == 0, '0.1', tostring(diff_absolute))
+| extend ratio = round(toreal(diff_absolute2) / toreal(len1), 2)
+| where ratio <= 0.1
+| order by ratio asc
