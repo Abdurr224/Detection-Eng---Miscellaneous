@@ -1,0 +1,25 @@
+let alert = SecurityAlert
+| summarize arg_max(TimeGenerated, *) by SystemAlertId 
+| where AlertName contains "Form blocked due to potential phishing attempt"
+| extend parse_json(tostring(Entities))
+| project user = tostring(Entities[0].DisplayName);
+CloudAppEvents
+| where AccountDisplayName in (alert)
+| where isnotempty(RawEventData.FormId)
+| extend Creationtime = tostring(RawEventData.CreationTime)
+| extend Formid = tostring(RawEventData.FormId)
+| extend FormName = tostring(RawEventData.FormName)
+| extend Source = strcat(RawEventData.SourceApp, ",",RawEventData.Workload)
+| extend URL = iff(Source contains "MicrosoftForms", strcat("https://forms.office.com/Pages/AdminPhishingReviewPage.aspx?id=",Formid),"")
+| summarize
+    Count = count(),
+    FirstSeen = min(Creationtime),
+    Name = make_set(AccountDisplayName),
+    FormName = make_set(FormName),
+    Accounts = make_set(AccountDisplayName),
+    Source = make_set(Source),
+    FormID = make_set(Formid),
+    URL = make_set(URL)
+    by ActionType
+| project FirstSeen,Name,FormName, Action =strcat(ActionType," (",Count,")"),FormID,URL, Source
+| sort by (FirstSeen) desc
